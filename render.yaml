@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: truthblox-video-render
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BASE_URL
+        sync: false
