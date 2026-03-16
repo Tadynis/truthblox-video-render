@@ -16,13 +16,12 @@ app.use(express.json({ limit: "10mb" }));
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-const WORK_DIR = path.join(__dirname, "tmp");
-const PUBLIC_DIR = path.join(__dirname, "public");
-const OUTPUT_DIR = path.join(PUBLIC_DIR, "videos");
+// Render aplinkoje saugiausia naudoti /tmp
+const WORK_DIR = "/tmp";
+const OUTPUT_DIR = "/tmp/videos";
 
-// Užtikriname, kad visi reikalingi katalogai egzistuoja
+// Užtikriname, kad reikalingi katalogai egzistuoja
 fs.ensureDirSync(WORK_DIR);
-fs.ensureDirSync(PUBLIC_DIR);
 fs.ensureDirSync(OUTPUT_DIR);
 
 app.use("/videos", express.static(OUTPUT_DIR));
