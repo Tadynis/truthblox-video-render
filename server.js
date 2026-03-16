@@ -17,9 +17,12 @@ const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 const WORK_DIR = path.join(__dirname, "tmp");
-const OUTPUT_DIR = path.join(__dirname, "public", "videos");
+const PUBLIC_DIR = path.join(__dirname, "public");
+const OUTPUT_DIR = path.join(PUBLIC_DIR, "videos");
 
+// Užtikriname, kad visi reikalingi katalogai egzistuoja
 fs.ensureDirSync(WORK_DIR);
+fs.ensureDirSync(PUBLIC_DIR);
 fs.ensureDirSync(OUTPUT_DIR);
 
 app.use("/videos", express.static(OUTPUT_DIR));
@@ -40,6 +43,8 @@ async function downloadImage(url, outputPath) {
     method: "GET",
     url,
     responseType: "stream",
+    timeout: 30000,
+    maxRedirects: 5,
   });
 
   await new Promise((resolve, reject) => {
@@ -50,11 +55,25 @@ async function downloadImage(url, outputPath) {
   });
 }
 
+app.get("/", (_req, res) => {
+  res.json({
+    service: "truthblox-video-render",
+    status: "ok",
+    endpoints: {
+      health: "/health",
+      render: "/render",
+      videos: "/videos/:file",
+    },
+  });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
 app.post("/render", async (req, res) => {
+  let inputImagePath = null;
+
   try {
     const {
       image,
@@ -71,13 +90,25 @@ app.post("/render", async (req, res) => {
 
     const [width, height] = format.split("x").map(Number);
     if (!width || !height) {
-      return res.status(400).json({ error: "Invalid format, expected WIDTHxHEIGHT" });
+      return res.status(400).json({
+        error: "Invalid format, expected WIDTHxHEIGHT",
+      });
+    }
+
+    const safeDuration = Number(duration);
+    if (!safeDuration || safeDuration <= 0) {
+      return res.status(400).json({
+        error: "Invalid duration",
+      });
     }
 
     const jobId = uuidv4();
-    const inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
+    inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
     const outputVideoName = `${jobId}.mp4`;
     const outputVideoPath = path.join(OUTPUT_DIR, outputVideoName);
+
+    // Dar kartą užtikriname, kad output katalogas egzistuoja runtime metu
+    fs.ensureDirSync(OUTPUT_DIR);
 
     await downloadImage(image, inputImagePath);
 
@@ -88,7 +119,7 @@ app.post("/render", async (req, res) => {
     const filters = [
       `scale=${width}:${height}:force_original_aspect_ratio=increase`,
       `crop=${width}:${height}`,
-      `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(Number(duration) * 25)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
+      `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(safeDuration * 25)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
       `drawtext=text='${safeLine1}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=h*0.15`,
       `drawtext=text='${safeLine2}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=h*0.32`,
       `drawtext=text='${safeCta}':fontcolor=white:fontsize=46:box=1:boxcolor=black@0.55:boxborderw=20:x=(w-text_w)/2:y=h*0.80`,
@@ -96,22 +127,35 @@ app.post("/render", async (req, res) => {
 
     await new Promise((resolve, reject) => {
       ffmpeg(inputImagePath)
-        .loop(Number(duration))
+        .loop(safeDuration)
         .videoFilters(filters)
         .outputOptions([
-          "-t", String(duration),
+          "-t", String(safeDuration),
           "-pix_fmt", "yuv420p",
           "-c:v", "libx264",
-          "-movflags", "+faststart"
+          "-movflags", "+faststart",
         ])
         .size(`${width}x${height}`)
         .fps(25)
-        .save(outputVideoPath)
+        .on("start", (commandLine) => {
+          console.log("FFmpeg start:", commandLine);
+        })
+        .on("stderr", (stderrLine) => {
+          console.log("FFmpeg stderr:", stderrLine);
+        })
         .on("end", resolve)
-        .on("error", reject);
+        .on("error", (err) => {
+          reject(err);
+        })
+        .save(outputVideoPath);
     });
 
     const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
+
+    // Ištrinam laikiną paveikslėlį po sėkmingo renderio
+    if (inputImagePath && (await fs.pathExists(inputImagePath))) {
+      await fs.remove(inputImagePath);
+    }
 
     return res.json({
       video_url: videoUrl,
@@ -119,6 +163,16 @@ app.post("/render", async (req, res) => {
     });
   } catch (error) {
     console.error("Render error:", error);
+
+    // Bandome išvalyti laikiną failą ir klaidos atveju
+    try {
+      if (inputImagePath && (await fs.pathExists(inputImagePath))) {
+        await fs.remove(inputImagePath);
+      }
+    } catch (cleanupError) {
+      console.error("Cleanup error:", cleanupError);
+    }
+
     return res.status(500).json({
       error: "Render failed",
       details: error.message,
@@ -128,4 +182,6 @@ app.post("/render", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Truthblox video render server listening on port ${PORT}`);
+  console.log(`WORK_DIR: ${WORK_DIR}`);
+  console.log(`OUTPUT_DIR: ${OUTPUT_DIR}`);
 });
