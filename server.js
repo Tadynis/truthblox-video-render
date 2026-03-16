@@ -27,17 +27,6 @@ fs.ensureDirSync(OUTPUT_DIR);
 
 app.use("/videos", express.static(OUTPUT_DIR));
 
-function escapeText(text = "") {
-  return String(text)
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/,/g, "\\,")
-    .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]")
-    .replace(/\n/g, " ");
-}
-
 async function downloadImage(url, outputPath) {
   const response = await axios({
     method: "GET",
@@ -77,9 +66,6 @@ app.post("/render", async (req, res) => {
   try {
     const {
       image,
-      line1 = "",
-      line2 = "",
-      cta = "",
       duration = 6,
       format = "1080x1920",
     } = req.body;
@@ -112,17 +98,10 @@ app.post("/render", async (req, res) => {
 
     await downloadImage(image, inputImagePath);
 
-    const safeLine1 = escapeText(line1);
-    const safeLine2 = escapeText(line2);
-    const safeCta = escapeText(cta);
-
     const filters = [
       `scale=${width}:${height}:force_original_aspect_ratio=increase`,
       `crop=${width}:${height}`,
       `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(safeDuration * 25)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
-      `drawtext=text='${safeLine1}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=h*0.15`,
-      `drawtext=text='${safeLine2}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=h*0.32`,
-      `drawtext=text='${safeCta}':fontcolor=white:fontsize=46:box=1:boxcolor=black@0.55:boxborderw=20:x=(w-text_w)/2:y=h*0.80`,
     ];
 
     await new Promise((resolve, reject) => {
