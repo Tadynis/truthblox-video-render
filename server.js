@@ -32,12 +32,12 @@ fs.ensureDirSync(OUTPUT_DIR);
 
 app.use("/videos", express.static(OUTPUT_DIR));
 
-async function downloadImage(url, outputPath) {
+async function downloadFile(url, outputPath) {
   const response = await axios({
     method: "GET",
     url,
     responseType: "stream",
-    timeout: 30000,
+    timeout: 60000,
     maxRedirects: 5,
   });
 
@@ -49,6 +49,35 @@ async function downloadImage(url, outputPath) {
   });
 }
 
+function sanitizeDrawtext(text = "") {
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/'/g, "\\'")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)")
+    .replace(/\?/g, "\\?")
+    .replace(/!/g, "\\!")
+    .replace(/%/g, "\\%")
+    .replace(/\n/g, " ");
+}
+
+async function runCommand(command) {
+  return new Promise((resolve, reject) => {
+    exec(command, { maxBuffer: 1024 * 1024 * 20 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error("Command failed:", command);
+        console.error("stderr:", stderr);
+        return reject(new Error(stderr || error.message));
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
 app.get("/", (_req, res) => {
   res.json({
     service: "truthblox-video-render",
@@ -57,6 +86,7 @@ app.get("/", (_req, res) => {
       health: "/health",
       test_ffmpeg: "/test-ffmpeg",
       render: "/render",
+      overlay_video: "/overlay-video",
       videos: "/videos/:file",
     },
   });
@@ -98,6 +128,7 @@ app.get("/test-ffmpeg", (_req, res) => {
   });
 });
 
+// Senas endpointas išlieka, jei dar jo reikia paveikslėlio -> video renderiui
 app.post("/render", async (req, res) => {
   let inputImagePath = null;
 
@@ -131,14 +162,9 @@ app.post("/render", async (req, res) => {
     const outputVideoName = `${jobId}.mp4`;
     const outputVideoPath = path.join(OUTPUT_DIR, outputVideoName);
 
-    // Dar kartą užtikriname, kad output katalogas egzistuoja runtime metu
     fs.ensureDirSync(OUTPUT_DIR);
 
-    console.log("Downloading image:", image);
-    console.log("Input image path:", inputImagePath);
-    console.log("Output video path:", outputVideoPath);
-
-    await downloadImage(image, inputImagePath);
+    await downloadFile(image, inputImagePath);
 
     const filters = [
       `scale=${width}:${height}:force_original_aspect_ratio=increase`,
@@ -174,7 +200,6 @@ app.post("/render", async (req, res) => {
 
     const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
 
-    // Ištrinam laikiną paveikslėlį po sėkmingo renderio
     if (inputImagePath && (await fs.pathExists(inputImagePath))) {
       await fs.remove(inputImagePath);
     }
@@ -187,7 +212,6 @@ app.post("/render", async (req, res) => {
   } catch (error) {
     console.error("Render error:", error);
 
-    // Bandome išvalyti laikiną failą ir klaidos atveju
     try {
       if (inputImagePath && (await fs.pathExists(inputImagePath))) {
         await fs.remove(inputImagePath);
@@ -198,6 +222,117 @@ app.post("/render", async (req, res) => {
 
     return res.status(500).json({
       error: "Render failed",
+      details: error.message,
+      ffmpeg_path: ffmpegPath,
+    });
+  }
+});
+
+// Naujas endpointas: video + line1 + line2 + CTA
+app.post("/overlay-video", async (req, res) => {
+  const tempFiles = [];
+
+  try {
+    const {
+      video,
+      line1 = "LINE1",
+      line2 = "LINE2",
+      cta = "www.truthblox.com",
+      width = 720,
+      height = 1280,
+      fontsize = 48,
+    } = req.body;
+
+    if (!video) {
+      return res.status(400).json({ error: "Missing video URL" });
+    }
+
+    const safeWidth = Number(width);
+    const safeHeight = Number(height);
+    const safeFontsize = Number(fontsize);
+
+    if (!safeWidth || !safeHeight) {
+      return res.status(400).json({ error: "Invalid width/height" });
+    }
+
+    const jobId = uuidv4();
+
+    const inputPath = path.join(WORK_DIR, `${jobId}-input.mp4`);
+    const tempPath = path.join(WORK_DIR, `${jobId}-temp.mp4`);
+    const ctaPath = path.join(WORK_DIR, `${jobId}-cta.mp4`);
+    const listPath = path.join(WORK_DIR, `${jobId}-list.txt`);
+    const finalName = `${jobId}-final.mp4`;
+    const finalPath = path.join(OUTPUT_DIR, finalName);
+
+    tempFiles.push(inputPath, tempPath, ctaPath, listPath);
+
+    fs.ensureDirSync(OUTPUT_DIR);
+
+    await downloadFile(video, inputPath);
+
+    const safeLine1 = sanitizeDrawtext(line1);
+    const safeLine2 = sanitizeDrawtext(line2);
+    const safeCta = sanitizeDrawtext(cta);
+
+    const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+
+    const overlayCmd =
+      `"${ffmpegPath}" -y -i "${inputPath}" ` +
+      `-vf "drawtext=fontfile=${fontPath}:text='${safeLine1}':enable='between(t,0,3)':x=(w-text_w)/2:y=h-200:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20,` +
+      `drawtext=fontfile=${fontPath}:text='${safeLine2}':enable='between(t,3,6)':x=(w-text_w)/2:y=h-200:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20" ` +
+      `-t 6 -c:v libx264 -pix_fmt yuv420p -movflags +faststart "${tempPath}"`;
+
+    console.log("Overlay command:", overlayCmd);
+    await runCommand(overlayCmd);
+
+    const ctaCmd =
+      `"${ffmpegPath}" -y -f lavfi -i color=c=black:s=${safeWidth}x${safeHeight}:d=3 ` +
+      `-vf "drawtext=fontfile=${fontPath}:text='${safeCta}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20" ` +
+      `-c:v libx264 -pix_fmt yuv420p -movflags +faststart "${ctaPath}"`;
+
+    console.log("CTA command:", ctaCmd);
+    await runCommand(ctaCmd);
+
+    const listContent = `file '${tempPath}'\nfile '${ctaPath}'\n`;
+    await fs.writeFile(listPath, listContent, "utf8");
+
+    const concatCmd =
+      `"${ffmpegPath}" -y -f concat -safe 0 -i "${listPath}" ` +
+      `-c:v libx264 -pix_fmt yuv420p -movflags +faststart "${finalPath}"`;
+
+    console.log("Concat command:", concatCmd);
+    await runCommand(concatCmd);
+
+    const finalUrl = `${BASE_URL}/videos/${finalName}`;
+
+    for (const file of tempFiles) {
+      if (await fs.pathExists(file)) {
+        await fs.remove(file);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      status: "video_ready",
+      video_url: finalUrl,
+      ffmpeg_path: ffmpegPath,
+    });
+  } catch (error) {
+    console.error("Overlay video error:", error);
+
+    for (const file of tempFiles) {
+      try {
+        if (await fs.pathExists(file)) {
+          await fs.remove(file);
+        }
+      } catch (cleanupError) {
+        console.error("Cleanup error:", cleanupError);
+      }
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: "Overlay video failed",
       details: error.message,
       ffmpeg_path: ffmpegPath,
     });
