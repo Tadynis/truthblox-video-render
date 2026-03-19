@@ -35,14 +35,21 @@ function normalizeUrl(value) {
 
   let url = String(value).trim();
 
-  // Pašaliname aplinkines kabutes, jei jų atsirado iš n8n / JSON
-  url = url.replace(/^['"]+|['"]+$/g, "").trim();
+  // Pašaliname dvigubas ir viengubas kabutes iš pradžios/galo
+  url = url.replace(/^"+|"+$/g, "");
+  url = url.replace(/^'+|'+$/g, "");
 
-  return url;
+  // Pašaliname escape backslash'us, jei URL buvo dvigubai serializuotas
+  url = url.replace(/\\/g, "");
+
+  return url.trim();
 }
 
 async function downloadFile(url, outputPath) {
+  console.log("RAW URL:", url);
+
   const safeUrl = normalizeUrl(url);
+  console.log("NORMALIZED URL:", safeUrl);
 
   if (!safeUrl) {
     throw new Error("downloadFile: empty URL");
@@ -307,7 +314,10 @@ app.post("/overlay-video", async (req, res) => {
       fontsize = 48,
     } = req.body;
 
+    console.log("Overlay request body video RAW:", video);
+
     const safeVideoUrl = normalizeUrl(video);
+    console.log("Overlay request body video NORMALIZED:", safeVideoUrl);
 
     if (!safeVideoUrl) {
       return res.status(400).json({ error: "Missing video URL" });
@@ -350,7 +360,6 @@ app.post("/overlay-video", async (req, res) => {
       throw new Error(`Font file not found: ${fontPath}`);
     }
 
-    // Pirmas 6 s klipas: video + 2 tekstai
     const overlayFilter =
       `scale=${safeWidth}:${safeHeight}:force_original_aspect_ratio=increase,` +
       `crop=${safeWidth}:${safeHeight},` +
@@ -377,7 +386,6 @@ app.post("/overlay-video", async (req, res) => {
       tempPath,
     ]);
 
-    // CTA klipas 3 s
     const ctaFilter =
       `drawtext=fontfile=${fontPath}:text='${safeCta}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
 
@@ -401,7 +409,6 @@ app.post("/overlay-video", async (req, res) => {
       ctaPath,
     ]);
 
-    // Concat failas
     const listContent = `file '${tempPath}'\nfile '${ctaPath}'\n`;
     await fs.writeFile(listPath, listContent, "utf8");
 
