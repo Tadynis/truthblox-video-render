@@ -31,25 +31,31 @@ fs.ensureDirSync(OUTPUT_DIR);
 app.use("/videos", express.static(OUTPUT_DIR));
 
 function normalizeUrl(value) {
-  if (value === undefined || value === null) return "";
+  if (!value) return "";
 
   let url = String(value).trim();
 
-  // Pašaliname dvigubas ir viengubas kabutes iš pradžios/galo
-  url = url.replace(/^"+|"+$/g, "");
-  url = url.replace(/^'+|'+$/g, "");
-
-  // Pašaliname escape backslash'us, jei URL buvo dvigubai serializuotas
+  // pašalina visus escape simbolius
   url = url.replace(/\\/g, "");
+
+  // pašalina visas kabutes iš pradžios
+  while (url.startsWith('"') || url.startsWith("'")) {
+    url = url.substring(1);
+  }
+
+  // pašalina visas kabutes iš galo
+  while (url.endsWith('"') || url.endsWith("'")) {
+    url = url.slice(0, -1);
+  }
 
   return url.trim();
 }
 
 async function downloadFile(url, outputPath) {
-  console.log("RAW URL:", url);
+  console.log("RAW URL >>>", url);
 
   const safeUrl = normalizeUrl(url);
-  console.log("NORMALIZED URL:", safeUrl);
+  console.log("NORMALIZED URL >>>", safeUrl);
 
   if (!safeUrl) {
     throw new Error("downloadFile: empty URL");
@@ -314,10 +320,10 @@ app.post("/overlay-video", async (req, res) => {
       fontsize = 48,
     } = req.body;
 
-    console.log("Overlay request body video RAW:", video);
+    console.log("Overlay request body video RAW >>>", video);
 
     const safeVideoUrl = normalizeUrl(video);
-    console.log("Overlay request body video NORMALIZED:", safeVideoUrl);
+    console.log("Overlay request body video NORMALIZED >>>", safeVideoUrl);
 
     if (!safeVideoUrl) {
       return res.status(400).json({ error: "Missing video URL" });
