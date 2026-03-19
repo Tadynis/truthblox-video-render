@@ -6,8 +6,14 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
+const { exec } = require("child_process");
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+if (!ffmpegPath) {
+  console.error("ffmpeg-static path not found");
+} else {
+  console.log("Using ffmpeg path:", ffmpegPath);
+  ffmpeg.setFfmpegPath(ffmpegPath);
+}
 
 const app = express();
 app.use(cors());
@@ -49,6 +55,7 @@ app.get("/", (_req, res) => {
     status: "ok",
     endpoints: {
       health: "/health",
+      test_ffmpeg: "/test-ffmpeg",
       render: "/render",
       videos: "/videos/:file",
     },
@@ -56,7 +63,39 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    service: "truthblox-video-render",
+    ffmpegPath,
+  });
+});
+
+app.get("/test-ffmpeg", (_req, res) => {
+  if (!ffmpegPath) {
+    return res.status(500).json({
+      ok: false,
+      error: "ffmpeg-static path not found",
+    });
+  }
+
+  exec(`"${ffmpegPath}" -version`, (error, stdout, stderr) => {
+    if (error) {
+      console.error("ffmpeg test error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "ffmpeg execution failed",
+        details: error.message,
+        stderr,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message: "ffmpeg works",
+      ffmpegPath,
+      output: stdout,
+    });
+  });
 });
 
 app.post("/render", async (req, res) => {
@@ -95,6 +134,10 @@ app.post("/render", async (req, res) => {
     // Dar kartą užtikriname, kad output katalogas egzistuoja runtime metu
     fs.ensureDirSync(OUTPUT_DIR);
 
+    console.log("Downloading image:", image);
+    console.log("Input image path:", inputImagePath);
+    console.log("Output video path:", outputVideoPath);
+
     await downloadImage(image, inputImagePath);
 
     const filters = [
@@ -123,6 +166,7 @@ app.post("/render", async (req, res) => {
         })
         .on("end", resolve)
         .on("error", (err) => {
+          console.error("FFmpeg render error:", err);
           reject(err);
         })
         .save(outputVideoPath);
@@ -138,6 +182,7 @@ app.post("/render", async (req, res) => {
     return res.json({
       video_url: videoUrl,
       status: "video_ready",
+      ffmpeg_path: ffmpegPath,
     });
   } catch (error) {
     console.error("Render error:", error);
@@ -154,12 +199,15 @@ app.post("/render", async (req, res) => {
     return res.status(500).json({
       error: "Render failed",
       details: error.message,
+      ffmpeg_path: ffmpegPath,
     });
   }
 });
 
 app.listen(PORT, () => {
   console.log(`Truthblox video render server listening on port ${PORT}`);
+  console.log(`BASE_URL: ${BASE_URL}`);
   console.log(`WORK_DIR: ${WORK_DIR}`);
   console.log(`OUTPUT_DIR: ${OUTPUT_DIR}`);
+  console.log(`FFMPEG_PATH: ${ffmpegPath}`);
 });
