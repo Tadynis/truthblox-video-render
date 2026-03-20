@@ -51,6 +51,61 @@ function normalizeUrl(value) {
   return url.trim();
 }
 
+function normalizeOverlayText(value, fallback = "") {
+  const text = String(value ?? fallback)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\t/g, " ")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return text || fallback;
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  if (text.length <= maxLength) return text;
+
+  return text.slice(0, maxLength).trim();
+}
+
+function escapeFilterValue(value = "") {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/,/g, "\\,")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/=/g, "\\=");
+}
+
+function getFontPath() {
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `Font file not found. Checked: ${candidates.join(", ")}`
+  );
+}
+
+async function writeTextFile(filePath, text) {
+  // ffmpeg drawtext per textfile mėgsta paprastą utf-8 tekstą
+  await fs.writeFile(filePath, String(text || ""), "utf8");
+}
+
 async function downloadFile(url, outputPath) {
   console.log("RAW URL >>>", url);
 
@@ -103,22 +158,6 @@ async function downloadFile(url, outputPath) {
   console.log("Downloaded file size:", stats.size);
 }
 
-function sanitizeDrawtext(text = "") {
-  return String(text)
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\\'")
-    .replace(/,/g, "\\,")
-    .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]")
-    .replace(/\(/g, "\\(")
-    .replace(/\)/g, "\\)")
-    .replace(/\?/g, "\\?")
-    .replace(/!/g, "\\!")
-    .replace(/%/g, "\\%")
-    .replace(/\n/g, " ");
-}
-
 async function cleanupFiles(files = []) {
   for (const file of files) {
     try {
@@ -140,14 +179,14 @@ async function runFfmpeg(args) {
       args,
       { maxBuffer: 1024 * 1024 * 20 },
       (error, stdout, stderr) => {
+        if (stderr) {
+          console.log("FFmpeg stderr:", stderr);
+        }
+
         if (error) {
           console.error("FFmpeg args failed:", args);
           console.error("FFmpeg stderr:", stderr);
           return reject(new Error(stderr || error.message));
-        }
-
-        if (stderr) {
-          console.log("FFmpeg stderr:", stderr);
         }
 
         resolve({ stdout, stderr });
@@ -314,7 +353,7 @@ app.post("/overlay-video", async (req, res) => {
       video,
       line1 = "LINE1",
       line2 = "LINE2",
-      cta = "www.truthblox.com",
+      cta = "truthblox.com",
       width = 720,
       height = 1280,
       fontsize = 48,
@@ -341,36 +380,49 @@ app.post("/overlay-video", async (req, res) => {
       return res.status(400).json({ error: "Invalid fontsize" });
     }
 
+    const safeLine1 = truncateText(normalizeOverlayText(line1, "LINE1"), 40);
+    const safeLine2 = truncateText(normalizeOverlayText(line2, "LINE2"), 40);
+    const safeCta = truncateText(normalizeOverlayText(cta, "truthblox.com"), 30);
+
     const jobId = uuidv4();
 
     const inputPath = path.join(WORK_DIR, `${jobId}-input.mp4`);
     const tempPath = path.join(WORK_DIR, `${jobId}-temp.mp4`);
     const ctaPath = path.join(WORK_DIR, `${jobId}-cta.mp4`);
-    const listPath = path.join(WORK_DIR, `${jobId}-list.txt`);
-    const finalName = `${jobId}-final.mp4`;
-    const finalPath = path.join(OUTPUT_DIR, finalName);
+    const finalPath = path.join(OUTPUT_DIR, `${jobId}-final.mp4`);
 
-    tempFiles.push(inputPath, tempPath, ctaPath, listPath);
+    const line1Path = path.join(WORK_DIR, `${jobId}-line1.txt`);
+    const line2Path = path.join(WORK_DIR, `${jobId}-line2.txt`);
+    const ctaTextPath = path.join(WORK_DIR, `${jobId}-cta.txt`);
+
+    tempFiles.push(
+      inputPath,
+      tempPath,
+      ctaPath,
+      line1Path,
+      line2Path,
+      ctaTextPath
+    );
 
     fs.ensureDirSync(OUTPUT_DIR);
 
     await downloadFile(safeVideoUrl, inputPath);
 
-    const safeLine1 = sanitizeDrawtext(line1);
-    const safeLine2 = sanitizeDrawtext(line2);
-    const safeCta = sanitizeDrawtext(cta);
+    const fontPath = getFontPath();
+    const safeFontPath = escapeFilterValue(fontPath);
+    const safeLine1Path = escapeFilterValue(line1Path);
+    const safeLine2Path = escapeFilterValue(line2Path);
+    const safeCtaPath = escapeFilterValue(ctaTextPath);
 
-    const fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-
-    if (!(await fs.pathExists(fontPath))) {
-      throw new Error(`Font file not found: ${fontPath}`);
-    }
+    await writeTextFile(line1Path, safeLine1);
+    await writeTextFile(line2Path, safeLine2);
+    await writeTextFile(ctaTextPath, safeCta);
 
     const overlayFilter =
       `scale=${safeWidth}:${safeHeight}:force_original_aspect_ratio=increase,` +
       `crop=${safeWidth}:${safeHeight},` +
-      `drawtext=fontfile=${fontPath}:text='${safeLine1}':enable='between(t,0,3)':x=(w-text_w)/2:y=h-200:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20,` +
-      `drawtext=fontfile=${fontPath}:text='${safeLine2}':enable='between(t,3,6)':x=(w-text_w)/2:y=h-200:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine1Path}:reload=0:enable='between(t,0,3)':x=(w-text_w)/2:y=h-220:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20,` +
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine2Path}:reload=0:enable='between(t,3,6)':x=(w-text_w)/2:y=h-220:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
 
     await runFfmpeg([
       "-y",
@@ -385,6 +437,8 @@ app.post("/overlay-video", async (req, res) => {
       "-an",
       "-c:v",
       "libx264",
+      "-preset",
+      "veryfast",
       "-pix_fmt",
       "yuv420p",
       "-movflags",
@@ -393,7 +447,8 @@ app.post("/overlay-video", async (req, res) => {
     ]);
 
     const ctaFilter =
-      `drawtext=fontfile=${fontPath}:text='${safeCta}':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeCtaPath}:reload=0:` +
+      `x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
 
     await runFfmpeg([
       "-y",
@@ -408,6 +463,8 @@ app.post("/overlay-video", async (req, res) => {
       "-an",
       "-c:v",
       "libx264",
+      "-preset",
+      "veryfast",
       "-pix_fmt",
       "yuv420p",
       "-movflags",
@@ -415,20 +472,21 @@ app.post("/overlay-video", async (req, res) => {
       ctaPath,
     ]);
 
-    const listContent = `file '${tempPath}'\nfile '${ctaPath}'\n`;
-    await fs.writeFile(listPath, listContent, "utf8");
-
     await runFfmpeg([
       "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
       "-i",
-      listPath,
+      tempPath,
+      "-i",
+      ctaPath,
+      "-filter_complex",
+      "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+      "-map",
+      "[v]",
       "-an",
       "-c:v",
       "libx264",
+      "-preset",
+      "veryfast",
       "-pix_fmt",
       "yuv420p",
       "-movflags",
@@ -436,7 +494,7 @@ app.post("/overlay-video", async (req, res) => {
       finalPath,
     ]);
 
-    const finalUrl = `${BASE_URL}/videos/${finalName}`;
+    const finalUrl = `${BASE_URL}/videos/${path.basename(finalPath)}`;
 
     await cleanupFiles(tempFiles);
 
