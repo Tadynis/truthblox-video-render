@@ -64,15 +64,6 @@ function normalizeOverlayText(value, fallback = "") {
   return text || fallback;
 }
 
-function truncateText(value, maxLength) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-
-  if (text.length <= maxLength) return text;
-
-  return text.slice(0, maxLength).trim();
-}
-
 function escapeFilterValue(value = "") {
   return String(value)
     .replace(/\\/g, "\\\\")
@@ -99,6 +90,38 @@ function getFontPath() {
   throw new Error(
     `Font file not found. Checked: ${candidates.join(", ")}`
   );
+}
+
+function wrapText(text, maxLineLength = 22, maxLines = 2) {
+  const clean = normalizeOverlayText(text, "");
+  if (!clean) return "";
+
+  const words = clean.split(" ");
+  const lines = [];
+  let currentLine = "";
+
+  for (const word of words) {
+    const testLine = currentLine ? `${currentLine} ${word}` : word;
+
+    if (testLine.length <= maxLineLength) {
+      currentLine = testLine;
+    } else {
+      if (currentLine) {
+        lines.push(currentLine);
+      }
+      currentLine = word;
+
+      if (lines.length >= maxLines - 1) {
+        break;
+      }
+    }
+  }
+
+  if (currentLine && lines.length < maxLines) {
+    lines.push(currentLine);
+  }
+
+  return lines.join("\n");
 }
 
 async function writeTextFile(filePath, text) {
@@ -353,10 +376,10 @@ app.post("/overlay-video", async (req, res) => {
       video,
       line1 = "LINE1",
       line2 = "LINE2",
-      cta = "truthblox.com",
+      cta = "www.truthblox.com",
       width = 720,
       height = 1280,
-      fontsize = 48,
+      fontsize = 38,
     } = req.body;
 
     console.log("Overlay request body video RAW >>>", video);
@@ -380,9 +403,9 @@ app.post("/overlay-video", async (req, res) => {
       return res.status(400).json({ error: "Invalid fontsize" });
     }
 
-    const safeLine1 = truncateText(normalizeOverlayText(line1, "LINE1"), 40);
-    const safeLine2 = truncateText(normalizeOverlayText(line2, "LINE2"), 40);
-    const safeCta = truncateText(normalizeOverlayText(cta, "truthblox.com"), 30);
+    const safeLine1 = wrapText(line1 || "LINE1", 22, 2);
+    const safeLine2 = wrapText(line2 || "LINE2", 22, 2);
+    const safeCta = normalizeOverlayText(cta, "www.truthblox.com");
 
     const jobId = uuidv4();
 
@@ -421,8 +444,8 @@ app.post("/overlay-video", async (req, res) => {
     const overlayFilter =
       `scale=${safeWidth}:${safeHeight}:force_original_aspect_ratio=increase,` +
       `crop=${safeWidth}:${safeHeight},` +
-      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine1Path}:reload=0:enable='between(t,0,3)':x=(w-text_w)/2:y=h-220:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20,` +
-      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine2Path}:reload=0:enable='between(t,3,6)':x=(w-text_w)/2:y=h-220:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine1Path}:reload=0:enable='between(t,0,3)':x=(w-text_w)/2:y=h-300:fontsize=${safeFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18,` +
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine2Path}:reload=0:enable='between(t,3,6)':x=(w-text_w)/2:y=h-300:fontsize=${safeFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
 
     await runFfmpeg([
       "-y",
@@ -448,7 +471,7 @@ app.post("/overlay-video", async (req, res) => {
 
     const ctaFilter =
       `drawtext=fontfile=${safeFontPath}:textfile=${safeCtaPath}:reload=0:` +
-      `x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsize}:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=20`;
+      `x=(w-text_w)/2:y=(h-text_h)/2:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
 
     await runFfmpeg([
       "-y",
