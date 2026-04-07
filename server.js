@@ -58,7 +58,7 @@ function normalizeOverlayText(value, fallback = "") {
     .replace(/\t/g, " ")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
-    .replace(/\s+/g, " ")
+    .replace(/[ ]{2,}/g, " ")
     .trim();
 
   return text || fallback;
@@ -71,7 +71,8 @@ function escapeFilterValue(value = "") {
     .replace(/,/g, "\\,")
     .replace(/\[/g, "\\[")
     .replace(/\]/g, "\\]")
-    .replace(/=/g, "\\=");
+    .replace(/=/g, "\\=")
+    .replace(/'/g, "\\'");
 }
 
 function getFontPath() {
@@ -92,7 +93,11 @@ function getFontPath() {
   );
 }
 
-function wrapText(text, maxLineLength = 22, maxLines = 2) {
+function limitText(text, max = 110) {
+  return String(text || "").slice(0, max).trim();
+}
+
+function wrapText(text, maxLineLength = 18, maxLines = 3) {
   const clean = normalizeOverlayText(text, "");
   if (!clean) return "";
 
@@ -110,22 +115,33 @@ function wrapText(text, maxLineLength = 22, maxLines = 2) {
         lines.push(currentLine);
       }
       currentLine = word;
-
-      if (lines.length >= maxLines - 1) {
-        break;
-      }
     }
   }
 
-  if (currentLine && lines.length < maxLines) {
+  if (currentLine) {
     lines.push(currentLine);
   }
 
-  return lines.join("\n");
+  if (lines.length <= maxLines) {
+    return lines.join("\n");
+  }
+
+  const trimmed = lines.slice(0, maxLines - 1);
+  const rest = lines.slice(maxLines - 1).join(" ");
+  trimmed.push(rest);
+
+  return trimmed.join("\n");
+}
+
+function getFontSize(text, shortSize = 42, mediumSize = 38, longSize = 34) {
+  const len = String(text || "").length;
+
+  if (len <= 35) return shortSize;
+  if (len <= 70) return mediumSize;
+  return longSize;
 }
 
 async function writeTextFile(filePath, text) {
-  // ffmpeg drawtext per textfile mėgsta paprastą utf-8 tekstą
   await fs.writeFile(filePath, String(text || ""), "utf8");
 }
 
@@ -380,6 +396,9 @@ app.post("/overlay-video", async (req, res) => {
       width = 720,
       height = 1280,
       fontsize = 38,
+      fontsize_line1,
+      fontsize_line2,
+      fontsize_cta,
     } = req.body;
 
     console.log("Overlay request body video RAW >>>", video);
@@ -393,19 +412,26 @@ app.post("/overlay-video", async (req, res) => {
 
     const safeWidth = Number(width);
     const safeHeight = Number(height);
-    const safeFontsize = Number(fontsize);
 
     if (!safeWidth || !safeHeight) {
       return res.status(400).json({ error: "Invalid width/height" });
     }
 
-    if (!safeFontsize || safeFontsize <= 0) {
-      return res.status(400).json({ error: "Invalid fontsize" });
-    }
+    const rawLine1 = limitText(line1 || "LINE1", 110);
+    const rawLine2 = limitText(line2 || "LINE2", 110);
+    const rawCta = limitText(cta || "www.truthblox.com", 60);
 
-    const safeLine1 = wrapText(line1 || "LINE1", 22, 2);
-    const safeLine2 = wrapText(line2 || "LINE2", 22, 2);
-    const safeCta = normalizeOverlayText(cta, "www.truthblox.com");
+    const safeLine1 = wrapText(rawLine1, 18, 3);
+    const safeLine2 = wrapText(rawLine2, 18, 3);
+    const safeCta = wrapText(rawCta, 20, 2);
+
+    const safeFontsizeLine1 =
+      Number(fontsize_line1) || getFontSize(rawLine1, 42, 38, 34);
+    const safeFontsizeLine2 =
+      Number(fontsize_line2) || getFontSize(rawLine2, 42, 38, 34);
+    const safeFontsizeCta =
+      Number(fontsize_cta) || 42;
+    const fallbackFontsize = Number(fontsize) || 38;
 
     const jobId = uuidv4();
 
@@ -441,11 +467,13 @@ app.post("/overlay-video", async (req, res) => {
     await writeTextFile(line2Path, safeLine2);
     await writeTextFile(ctaTextPath, safeCta);
 
+    const overlayY = `h-(text_h+180)`;
+
     const overlayFilter =
       `scale=${safeWidth}:${safeHeight}:force_original_aspect_ratio=increase,` +
       `crop=${safeWidth}:${safeHeight},` +
-      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine1Path}:reload=0:enable='between(t,0,3)':x=(w-text_w)/2:y=h-300:fontsize=${safeFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18,` +
-      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine2Path}:reload=0:enable='between(t,3,6)':x=(w-text_w)/2:y=h-300:fontsize=${safeFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine1Path}:reload=0:enable='between(t,0,3)':x=(w-text_w)/2:y=${overlayY}:fontsize=${safeFontsizeLine1 || fallbackFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18,` +
+      `drawtext=fontfile=${safeFontPath}:textfile=${safeLine2Path}:reload=0:enable='between(t,3,6)':x=(w-text_w)/2:y=${overlayY}:fontsize=${safeFontsizeLine2 || fallbackFontsize}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
 
     await runFfmpeg([
       "-y",
@@ -471,7 +499,7 @@ app.post("/overlay-video", async (req, res) => {
 
     const ctaFilter =
       `drawtext=fontfile=${safeFontPath}:textfile=${safeCtaPath}:reload=0:` +
-      `x=(w-text_w)/2:y=(h-text_h)/2:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
+      `x=(w-text_w)/2:y=(h-text_h)/2:fontsize=${safeFontsizeCta}:line_spacing=10:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=18`;
 
     await runFfmpeg([
       "-y",
@@ -526,6 +554,16 @@ app.post("/overlay-video", async (req, res) => {
       status: "video_ready",
       video_url: finalUrl,
       ffmpeg_path: ffmpegPath,
+      wrapped: {
+        line1: safeLine1,
+        line2: safeLine2,
+        cta: safeCta,
+      },
+      fontsizes: {
+        line1: safeFontsizeLine1 || fallbackFontsize,
+        line2: safeFontsizeLine2 || fallbackFontsize,
+        cta: safeFontsizeCta,
+      },
     });
   } catch (error) {
     console.error("Overlay video error:", error);
