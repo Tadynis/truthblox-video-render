@@ -88,9 +88,7 @@ function getFontPath() {
     }
   }
 
-  throw new Error(
-    `Font file not found. Checked: ${candidates.join(", ")}`
-  );
+  throw new Error(`Font file not found. Checked: ${candidates.join(", ")}`);
 }
 
 function limitText(text, max = 110) {
@@ -158,7 +156,7 @@ async function downloadFile(url, outputPath) {
   let parsedUrl;
   try {
     parsedUrl = new URL(safeUrl);
-  } catch (err) {
+  } catch (_err) {
     throw new Error(`downloadFile: invalid URL -> ${safeUrl}`);
   }
 
@@ -279,8 +277,8 @@ app.get("/test-ffmpeg", (_req, res) => {
 });
 
 // Render endpointas:
-// 1) SENAS režimas: image -> 1 frame video
-// 2) NAUJAS režimas: frame_1_url + frame_2_url -> 2 frame video
+// 1) SENAS režimas: image -> 1 frame video (be zoom)
+// 2) NAUJAS režimas: frame_1_url + frame_2_url -> 2 simple frame video
 app.post("/render", async (req, res) => {
   const tempFiles = [];
 
@@ -289,8 +287,8 @@ app.post("/render", async (req, res) => {
       image,
       frame_1_url,
       frame_2_url,
-      duration = 6,
-      format = "1080x1920",
+      duration = 5,
+      format = "720x1280",
       content_id = "",
     } = req.body;
 
@@ -322,7 +320,7 @@ app.post("/render", async (req, res) => {
 
     console.log("Render request body >>>", req.body);
 
-    // ===== SENAS 1 paveikslėlio režimas =====
+    // ===== SENAS 1 paveikslėlio režimas (be zoom) =====
     if (safeSingleImageUrl) {
       const inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
       tempFiles.push(inputImagePath);
@@ -332,9 +330,6 @@ app.post("/render", async (req, res) => {
       const filters = [
         `scale=${width}:${height}:force_original_aspect_ratio=increase`,
         `crop=${width}:${height}`,
-        `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(
-          safeDuration * 25
-        )}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
       ];
 
       await new Promise((resolve, reject) => {
@@ -348,6 +343,8 @@ app.post("/render", async (req, res) => {
             "yuv420p",
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
             "-movflags",
             "+faststart",
             "-an",
@@ -355,14 +352,14 @@ app.post("/render", async (req, res) => {
           .size(`${width}x${height}`)
           .fps(25)
           .on("start", (commandLine) => {
-            console.log("FFmpeg start:", commandLine);
+            console.log("FFmpeg single-image start:", commandLine);
           })
           .on("stderr", (stderrLine) => {
-            console.log("FFmpeg stderr:", stderrLine);
+            console.log("FFmpeg single-image stderr:", stderrLine);
           })
           .on("end", resolve)
           .on("error", (err) => {
-            console.error("FFmpeg render error:", err);
+            console.error("FFmpeg single-image render error:", err);
             reject(err);
           })
           .save(outputVideoPath);
@@ -398,7 +395,13 @@ app.post("/render", async (req, res) => {
     const clip2Path = path.join(WORK_DIR, `${jobId}-clip2.mp4`);
     const concatListPath = path.join(WORK_DIR, `${jobId}-concat.txt`);
 
-    tempFiles.push(frame1Path, frame2Path, clip1Path, clip2Path, concatListPath);
+    tempFiles.push(
+      frame1Path,
+      frame2Path,
+      clip1Path,
+      clip2Path,
+      concatListPath
+    );
 
     await downloadFile(safeFrame1Url, frame1Path);
     await downloadFile(safeFrame2Url, frame2Path);
@@ -422,6 +425,8 @@ app.post("/render", async (req, res) => {
             "yuv420p",
             "-c:v",
             "libx264",
+            "-preset",
+            "veryfast",
             "-movflags",
             "+faststart",
             "-an",
@@ -496,7 +501,7 @@ app.post("/render", async (req, res) => {
   }
 });
 
-// Naujas endpointas: video + line1 + line2 + CTA
+// Video overlay endpointas paliktas ateičiai, jei norėsi uždėti tekstą ir CTA
 app.post("/overlay-video", async (req, res) => {
   const tempFiles = [];
 
@@ -542,8 +547,7 @@ app.post("/overlay-video", async (req, res) => {
       Number(fontsize_line1) || getFontSize(rawLine1, 42, 38, 34);
     const safeFontsizeLine2 =
       Number(fontsize_line2) || getFontSize(rawLine2, 42, 38, 34);
-    const safeFontsizeCta =
-      Number(fontsize_cta) || 42;
+    const safeFontsizeCta = Number(fontsize_cta) || 42;
     const fallbackFontsize = Number(fontsize) || 38;
 
     const jobId = uuidv4();
