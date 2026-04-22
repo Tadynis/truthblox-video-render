@@ -278,20 +278,27 @@ app.get("/test-ffmpeg", (_req, res) => {
   });
 });
 
-// Senas endpointas: image -> video
+// Render endpointas:
+// 1) SENAS režimas: image -> 1 frame video
+// 2) NAUJAS režimas: frame_1_url + frame_2_url -> 2 frame video
 app.post("/render", async (req, res) => {
-  let inputImagePath = null;
+  const tempFiles = [];
 
   try {
-    const { image, duration = 6, format = "1080x1920" } = req.body;
+    const {
+      image,
+      frame_1_url,
+      frame_2_url,
+      duration = 6,
+      format = "1080x1920",
+      content_id = "",
+    } = req.body;
 
-    if (!image) {
-      return res.status(400).json({ error: "Missing image URL" });
-    }
+    const safeSingleImageUrl = normalizeUrl(image);
+    const safeFrame1Url = normalizeUrl(frame_1_url);
+    const safeFrame2Url = normalizeUrl(frame_2_url);
 
-    const safeImageUrl = normalizeUrl(image);
-
-    const [width, height] = format.split("x").map(Number);
+    const [width, height] = String(format).split("x").map(Number);
     if (!width || !height) {
       return res.status(400).json({
         error: "Invalid format, expected WIDTHxHEIGHT",
@@ -306,74 +313,180 @@ app.post("/render", async (req, res) => {
     }
 
     const jobId = uuidv4();
-    inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
-    const outputVideoName = `${jobId}.mp4`;
+    const outputVideoName = content_id
+      ? `${content_id}-${jobId}.mp4`
+      : `${jobId}.mp4`;
     const outputVideoPath = path.join(OUTPUT_DIR, outputVideoName);
 
     fs.ensureDirSync(OUTPUT_DIR);
 
-    await downloadFile(safeImageUrl, inputImagePath);
+    console.log("Render request body >>>", req.body);
 
-    const filters = [
-      `scale=${width}:${height}:force_original_aspect_ratio=increase`,
-      `crop=${width}:${height}`,
-      `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(
-        safeDuration * 25
-      )}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
-    ];
+    // ===== SENAS 1 paveikslėlio režimas =====
+    if (safeSingleImageUrl) {
+      const inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
+      tempFiles.push(inputImagePath);
 
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputImagePath)
-        .loop(safeDuration)
-        .videoFilters(filters)
-        .outputOptions([
-          "-t",
-          String(safeDuration),
-          "-pix_fmt",
-          "yuv420p",
-          "-c:v",
-          "libx264",
-          "-movflags",
-          "+faststart",
-          "-an",
-        ])
-        .size(`${width}x${height}`)
-        .fps(25)
-        .on("start", (commandLine) => {
-          console.log("FFmpeg start:", commandLine);
-        })
-        .on("stderr", (stderrLine) => {
-          console.log("FFmpeg stderr:", stderrLine);
-        })
-        .on("end", resolve)
-        .on("error", (err) => {
-          console.error("FFmpeg render error:", err);
-          reject(err);
-        })
-        .save(outputVideoPath);
-    });
+      await downloadFile(safeSingleImageUrl, inputImagePath);
+
+      const filters = [
+        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+        `crop=${width}:${height}`,
+        `zoompan=z='min(zoom+0.0008,1.08)':d=${Math.floor(
+          safeDuration * 25
+        )}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`,
+      ];
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(inputImagePath)
+          .loop(safeDuration)
+          .videoFilters(filters)
+          .outputOptions([
+            "-t",
+            String(safeDuration),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-movflags",
+            "+faststart",
+            "-an",
+          ])
+          .size(`${width}x${height}`)
+          .fps(25)
+          .on("start", (commandLine) => {
+            console.log("FFmpeg start:", commandLine);
+          })
+          .on("stderr", (stderrLine) => {
+            console.log("FFmpeg stderr:", stderrLine);
+          })
+          .on("end", resolve)
+          .on("error", (err) => {
+            console.error("FFmpeg render error:", err);
+            reject(err);
+          })
+          .save(outputVideoPath);
+      });
+
+      await cleanupFiles(tempFiles);
+
+      const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
+
+      return res.json({
+        video_url: videoUrl,
+        status: "video_ready",
+        ffmpeg_path: ffmpegPath,
+        mode: "single_image",
+      });
+    }
+
+    // ===== NAUJAS 2 paveikslėlių režimas =====
+    if (!safeFrame1Url || !safeFrame2Url) {
+      return res.status(400).json({
+        error: "Missing frame URL(s)",
+        received: {
+          image: !!safeSingleImageUrl,
+          frame_1_url: !!safeFrame1Url,
+          frame_2_url: !!safeFrame2Url,
+        },
+      });
+    }
+
+    const frame1Path = path.join(WORK_DIR, `${jobId}-frame1.png`);
+    const frame2Path = path.join(WORK_DIR, `${jobId}-frame2.png`);
+    const clip1Path = path.join(WORK_DIR, `${jobId}-clip1.mp4`);
+    const clip2Path = path.join(WORK_DIR, `${jobId}-clip2.mp4`);
+    const concatListPath = path.join(WORK_DIR, `${jobId}-concat.txt`);
+
+    tempFiles.push(frame1Path, frame2Path, clip1Path, clip2Path, concatListPath);
+
+    await downloadFile(safeFrame1Url, frame1Path);
+    await downloadFile(safeFrame2Url, frame2Path);
+
+    const clipDuration = safeDuration / 2;
+
+    const buildStillClip = async (inputImagePath, outputClipPath) => {
+      const filters = [
+        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+        `crop=${width}:${height}`,
+      ];
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(inputImagePath)
+          .loop(clipDuration)
+          .videoFilters(filters)
+          .outputOptions([
+            "-t",
+            String(clipDuration),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-movflags",
+            "+faststart",
+            "-an",
+          ])
+          .size(`${width}x${height}`)
+          .fps(25)
+          .on("start", (commandLine) => {
+            console.log("FFmpeg still clip start:", commandLine);
+          })
+          .on("stderr", (stderrLine) => {
+            console.log("FFmpeg still clip stderr:", stderrLine);
+          })
+          .on("end", resolve)
+          .on("error", (err) => {
+            console.error("FFmpeg still clip error:", err);
+            reject(err);
+          })
+          .save(outputClipPath);
+      });
+    };
+
+    await buildStillClip(frame1Path, clip1Path);
+    await buildStillClip(frame2Path, clip2Path);
+
+    const concatFileContent = [
+      `file '${clip1Path}'`,
+      `file '${clip2Path}'`,
+    ].join("\n");
+
+    await fs.writeFile(concatListPath, concatFileContent, "utf8");
+
+    await runFfmpeg([
+      "-y",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      concatListPath,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-pix_fmt",
+      "yuv420p",
+      "-movflags",
+      "+faststart",
+      "-an",
+      outputVideoPath,
+    ]);
+
+    await cleanupFiles(tempFiles);
 
     const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
-
-    if (inputImagePath && (await fs.pathExists(inputImagePath))) {
-      await fs.remove(inputImagePath);
-    }
 
     return res.json({
       video_url: videoUrl,
       status: "video_ready",
       ffmpeg_path: ffmpegPath,
+      mode: "two_frames",
     });
   } catch (error) {
     console.error("Render error:", error);
 
-    try {
-      if (inputImagePath && (await fs.pathExists(inputImagePath))) {
-        await fs.remove(inputImagePath);
-      }
-    } catch (cleanupError) {
-      console.error("Cleanup error:", cleanupError);
-    }
+    await cleanupFiles(tempFiles);
 
     return res.status(500).json({
       error: "Render failed",
