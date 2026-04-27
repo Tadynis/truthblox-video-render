@@ -7,12 +7,12 @@ app.post("/render", async (req, res) => {
       frame_1_url,
       frame_2_url,
 
-      // CTA IMAGE
+      // CTA aliases
+      cta,
       cta_image_url,
       cta_url,
       cta_duration = 3,
 
-      // duration = pagrindinių 2 frame trukmė, pvz 6s
       duration = 6,
       format = "720x1280",
       content_id = "",
@@ -21,39 +21,53 @@ app.post("/render", async (req, res) => {
     const safeSingleImageUrl = normalizeUrl(image);
     const safeFrame1Url = normalizeUrl(frame_1_url);
     const safeFrame2Url = normalizeUrl(frame_2_url);
-    const safeCtaUrl = normalizeUrl(cta_image_url || cta_url);
 
-    const [width, height] = String(format).split("x").map(Number);
+    // SVARBU: priimam visus galimus CTA field pavadinimus
+    const safeCtaUrl = normalizeUrl(cta_image_url || cta_url || cta);
+
+    let safeFormat = String(format || "720x1280").trim();
+
+    // Jei iš n8n ateina "mp4", "undefined" ar nesąmonė, naudojam default
+    if (!safeFormat.includes("x")) {
+      safeFormat = "720x1280";
+    }
+
+    const [width, height] = safeFormat.split("x").map(Number);
+
     if (!width || !height) {
       return res.status(400).json({
         error: "Invalid format, expected WIDTHxHEIGHT",
+        received_format: format,
+        used_format: safeFormat,
       });
     }
 
-    const safeDuration = Number(duration);
-    if (!safeDuration || safeDuration <= 0) {
-      return res.status(400).json({
-        error: "Invalid duration",
-      });
-    }
-
-    const safeCtaDuration = Number(cta_duration) || 3;
-    if (safeCtaDuration <= 0) {
-      return res.status(400).json({
-        error: "Invalid cta_duration",
-      });
-    }
+    const safeDuration = Number(duration) > 0 ? Number(duration) : 6;
+    const safeCtaDuration = Number(cta_duration) > 0 ? Number(cta_duration) : 3;
 
     const jobId = uuidv4();
-    const outputVideoName = content_id
-      ? `${content_id}-${jobId}.mp4`
+
+    const cleanContentId = String(content_id || "")
+      .replace(/[^a-zA-Z0-9_-]/g, "")
+      .slice(0, 80);
+
+    const outputVideoName = cleanContentId
+      ? `${cleanContentId}-${jobId}.mp4`
       : `${jobId}.mp4`;
 
     const outputVideoPath = path.join(OUTPUT_DIR, outputVideoName);
 
+    fs.ensureDirSync(WORK_DIR);
     fs.ensureDirSync(OUTPUT_DIR);
 
     console.log("Render request body >>>", req.body);
+    console.log("CTA DEBUG >>>", {
+      cta,
+      cta_image_url,
+      cta_url,
+      safeCtaUrl,
+      has_cta: !!safeCtaUrl,
+    });
 
     // ===== SENAS 1 paveikslėlio režimas =====
     if (safeSingleImageUrl) {
@@ -93,10 +107,7 @@ app.post("/render", async (req, res) => {
             console.log("FFmpeg single-image stderr:", stderrLine);
           })
           .on("end", resolve)
-          .on("error", (err) => {
-            console.error("FFmpeg single-image render error:", err);
-            reject(err);
-          })
+          .on("error", reject)
           .save(outputVideoPath);
       });
 
@@ -113,7 +124,7 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    // ===== 2 paveikslėliai + optional CTA paveikslėlis =====
+    // ===== 2 paveikslėliai + optional CTA =====
     if (!safeFrame1Url || !safeFrame2Url) {
       return res.status(400).json({
         error: "Missing frame URL(s)",
@@ -121,7 +132,10 @@ app.post("/render", async (req, res) => {
           image: !!safeSingleImageUrl,
           frame_1_url: !!safeFrame1Url,
           frame_2_url: !!safeFrame2Url,
-          cta_image_url: !!safeCtaUrl,
+          cta: !!cta,
+          cta_image_url: !!cta_image_url,
+          cta_url: !!cta_url,
+          safe_cta_url: !!safeCtaUrl,
         },
       });
     }
@@ -181,10 +195,7 @@ app.post("/render", async (req, res) => {
             console.log("FFmpeg still clip stderr:", stderrLine);
           })
           .on("end", resolve)
-          .on("error", (err) => {
-            console.error("FFmpeg still clip error:", err);
-            reject(err);
-          })
+          .on("error", reject)
           .save(outputClipPath);
       });
     };
@@ -200,9 +211,11 @@ app.post("/render", async (req, res) => {
     let mode = "two_frames";
     let totalDuration = safeDuration;
 
-    // ===== CTA paveikslėlis kaip 3 sekundžių final frame =====
+    // ===== CTA kaip final frame =====
     if (safeCtaUrl) {
       tempFiles.push(ctaImagePath, ctaClipPath);
+
+      console.log("Downloading CTA image >>>", safeCtaUrl);
 
       await downloadFile(safeCtaUrl, ctaImagePath);
       await buildStillClip(ctaImagePath, ctaClipPath, safeCtaDuration);
@@ -211,11 +224,14 @@ app.post("/render", async (req, res) => {
 
       mode = "two_frames_plus_cta";
       totalDuration = safeDuration + safeCtaDuration;
+    } else {
+      console.log("NO CTA URL RECEIVED, rendering only 2 frames");
     }
 
     const concatFileContent = concatFiles.join("\n");
-
     await fs.writeFile(concatListPath, concatFileContent, "utf8");
+
+    console.log("Concat file content >>>", concatFileContent);
 
     await runFfmpeg([
       "-y",
@@ -250,6 +266,7 @@ app.post("/render", async (req, res) => {
       frame_duration: frameClipDuration,
       cta_duration: safeCtaUrl ? safeCtaDuration : 0,
       has_cta: !!safeCtaUrl,
+      used_format: `${width}x${height}`,
     });
   } catch (error) {
     console.error("Render error:", error);
