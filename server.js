@@ -1,3 +1,79 @@
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const fs = require("fs-extra");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
+const ffmpeg = require("fluent-ffmpeg");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "50mb" }));
+
+const PORT = process.env.PORT || 3000;
+
+const OUTPUT_DIR = path.join("/tmp", "videos");
+fs.ensureDirSync(OUTPUT_DIR);
+
+app.use("/videos", express.static(OUTPUT_DIR));
+
+function normalizeUrl(url) {
+  if (!url || typeof url !== "string") return "";
+  return url.trim();
+}
+
+async function downloadFile(url, outputPath) {
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+    timeout: 60000,
+  });
+
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(outputPath);
+    response.data.pipe(writer);
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+}
+
+function parseFormat(format) {
+  const fallback = { width: 720, height: 1280 };
+
+  if (!format || typeof format !== "string") return fallback;
+
+  const match = format.match(/^(\d+)x(\d+)$/);
+  if (!match) return fallback;
+
+  return {
+    width: Number(match[1]),
+    height: Number(match[2]),
+  };
+}
+
+function runFfmpeg(command) {
+  return new Promise((resolve, reject) => {
+    command
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "truthblox-video-render",
+    endpoint: "/render",
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
 app.post("/render", async (req, res) => {
   const tempFiles = [];
 
@@ -7,8 +83,6 @@ app.post("/render", async (req, res) => {
       frame_1_url,
       frame_2_url,
 
-      // CTA aliases
-      cta,
       cta_image_url,
       cta_url,
       cta_duration = 3,
@@ -21,262 +95,103 @@ app.post("/render", async (req, res) => {
     const safeSingleImageUrl = normalizeUrl(image);
     const safeFrame1Url = normalizeUrl(frame_1_url);
     const safeFrame2Url = normalizeUrl(frame_2_url);
+    const safeCtaUrl = normalizeUrl(cta_image_url || cta_url);
 
-    // SVARBU: priimam visus galimus CTA field pavadinimus
-    const safeCtaUrl = normalizeUrl(cta_image_url || cta_url || cta);
+    const { width, height } = parseFormat(format);
 
-    let safeFormat = String(format || "720x1280").trim();
+    const mainDuration = Number(duration) || 6;
+    const ctaDuration = Number(cta_duration) || 3;
 
-    // Jei iš n8n ateina "mp4", "undefined" ar nesąmonė, naudojam default
-    if (!safeFormat.includes("x")) {
-      safeFormat = "720x1280";
-    }
+    const jobId = content_id || uuidv4();
 
-    const [width, height] = safeFormat.split("x").map(Number);
+    const frame1Path = path.join("/tmp", `${jobId}_frame1.jpg`);
+    const frame2Path = path.join("/tmp", `${jobId}_frame2.jpg`);
+    const ctaPath = path.join("/tmp", `${jobId}_cta.jpg`);
+    const listPath = path.join("/tmp", `${jobId}_list.txt`);
+    const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
 
-    if (!width || !height) {
+    tempFiles.push(frame1Path, frame2Path, ctaPath, listPath);
+
+    if (safeFrame1Url && safeFrame2Url) {
+      await downloadFile(safeFrame1Url, frame1Path);
+      await downloadFile(safeFrame2Url, frame2Path);
+    } else if (safeSingleImageUrl) {
+      await downloadFile(safeSingleImageUrl, frame1Path);
+      await downloadFile(safeSingleImageUrl, frame2Path);
+    } else {
       return res.status(400).json({
-        error: "Invalid format, expected WIDTHxHEIGHT",
-        received_format: format,
-        used_format: safeFormat,
+        ok: false,
+        error: "Missing image, frame_1_url or frame_2_url",
       });
     }
 
-    const safeDuration = Number(duration) > 0 ? Number(duration) : 6;
-    const safeCtaDuration = Number(cta_duration) > 0 ? Number(cta_duration) : 3;
+    const frameDuration = mainDuration / 2;
 
-    const jobId = uuidv4();
+    let listContent = "";
 
-    const cleanContentId = String(content_id || "")
-      .replace(/[^a-zA-Z0-9_-]/g, "")
-      .slice(0, 80);
+    listContent += `file '${frame1Path}'\n`;
+    listContent += `duration ${frameDuration}\n`;
 
-    const outputVideoName = cleanContentId
-      ? `${cleanContentId}-${jobId}.mp4`
-      : `${jobId}.mp4`;
+    listContent += `file '${frame2Path}'\n`;
+    listContent += `duration ${frameDuration}\n`;
 
-    const outputVideoPath = path.join(OUTPUT_DIR, outputVideoName);
+    if (safeCtaUrl) {
+      await downloadFile(safeCtaUrl, ctaPath);
 
-    fs.ensureDirSync(WORK_DIR);
-    fs.ensureDirSync(OUTPUT_DIR);
-
-    console.log("Render request body >>>", req.body);
-    console.log("CTA DEBUG >>>", {
-      cta,
-      cta_image_url,
-      cta_url,
-      safeCtaUrl,
-      has_cta: !!safeCtaUrl,
-    });
-
-    // ===== SENAS 1 paveikslėlio režimas =====
-    if (safeSingleImageUrl) {
-      const inputImagePath = path.join(WORK_DIR, `${jobId}.png`);
-      tempFiles.push(inputImagePath);
-
-      await downloadFile(safeSingleImageUrl, inputImagePath);
-
-      const filters = [
-        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
-        `crop=${width}:${height}`,
-      ];
-
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputImagePath)
-          .loop(safeDuration)
-          .videoFilters(filters)
-          .outputOptions([
-            "-t",
-            String(safeDuration),
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-movflags",
-            "+faststart",
-            "-an",
-          ])
-          .size(`${width}x${height}`)
-          .fps(25)
-          .on("start", (commandLine) => {
-            console.log("FFmpeg single-image start:", commandLine);
-          })
-          .on("stderr", (stderrLine) => {
-            console.log("FFmpeg single-image stderr:", stderrLine);
-          })
-          .on("end", resolve)
-          .on("error", reject)
-          .save(outputVideoPath);
-      });
-
-      await cleanupFiles(tempFiles);
-
-      const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
-
-      return res.json({
-        video_url: videoUrl,
-        status: "video_ready",
-        ffmpeg_path: ffmpegPath,
-        mode: "single_image",
-        duration: safeDuration,
-      });
+      listContent += `file '${ctaPath}'\n`;
+      listContent += `duration ${ctaDuration}\n`;
+      listContent += `file '${ctaPath}'\n`;
+    } else {
+      listContent += `file '${frame2Path}'\n`;
     }
 
-    // ===== 2 paveikslėliai + optional CTA =====
-    if (!safeFrame1Url || !safeFrame2Url) {
-      return res.status(400).json({
-        error: "Missing frame URL(s)",
-        received: {
-          image: !!safeSingleImageUrl,
-          frame_1_url: !!safeFrame1Url,
-          frame_2_url: !!safeFrame2Url,
-          cta: !!cta,
-          cta_image_url: !!cta_image_url,
-          cta_url: !!cta_url,
-          safe_cta_url: !!safeCtaUrl,
-        },
-      });
-    }
+    await fs.writeFile(listPath, listContent);
 
-    const frame1Path = path.join(WORK_DIR, `${jobId}-frame1.png`);
-    const frame2Path = path.join(WORK_DIR, `${jobId}-frame2.png`);
-    const ctaImagePath = path.join(WORK_DIR, `${jobId}-cta.png`);
-
-    const clip1Path = path.join(WORK_DIR, `${jobId}-clip1.mp4`);
-    const clip2Path = path.join(WORK_DIR, `${jobId}-clip2.mp4`);
-    const ctaClipPath = path.join(WORK_DIR, `${jobId}-cta.mp4`);
-
-    const concatListPath = path.join(WORK_DIR, `${jobId}-concat.txt`);
-
-    tempFiles.push(
-      frame1Path,
-      frame2Path,
-      clip1Path,
-      clip2Path,
-      concatListPath
+    await runFfmpeg(
+      ffmpeg()
+        .input(listPath)
+        .inputOptions(["-f concat", "-safe 0"])
+        .outputOptions([
+          "-vf",
+          `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`,
+          "-r 30",
+          "-c:v libx264",
+          "-preset veryfast",
+          "-movflags +faststart",
+        ])
+        .output(outputPath)
     );
 
-    await downloadFile(safeFrame1Url, frame1Path);
-    await downloadFile(safeFrame2Url, frame2Path);
-
-    const frameClipDuration = safeDuration / 2;
-
-    const buildStillClip = async (inputImagePath, outputClipPath, clipDuration) => {
-      const filters = [
-        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
-        `crop=${width}:${height}`,
-      ];
-
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputImagePath)
-          .loop(clipDuration)
-          .videoFilters(filters)
-          .outputOptions([
-            "-t",
-            String(clipDuration),
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-movflags",
-            "+faststart",
-            "-an",
-          ])
-          .size(`${width}x${height}`)
-          .fps(25)
-          .on("start", (commandLine) => {
-            console.log("FFmpeg still clip start:", commandLine);
-          })
-          .on("stderr", (stderrLine) => {
-            console.log("FFmpeg still clip stderr:", stderrLine);
-          })
-          .on("end", resolve)
-          .on("error", reject)
-          .save(outputClipPath);
-      });
-    };
-
-    await buildStillClip(frame1Path, clip1Path, frameClipDuration);
-    await buildStillClip(frame2Path, clip2Path, frameClipDuration);
-
-    const concatFiles = [
-      `file '${clip1Path}'`,
-      `file '${clip2Path}'`,
-    ];
-
-    let mode = "two_frames";
-    let totalDuration = safeDuration;
-
-    // ===== CTA kaip final frame =====
-    if (safeCtaUrl) {
-      tempFiles.push(ctaImagePath, ctaClipPath);
-
-      console.log("Downloading CTA image >>>", safeCtaUrl);
-
-      await downloadFile(safeCtaUrl, ctaImagePath);
-      await buildStillClip(ctaImagePath, ctaClipPath, safeCtaDuration);
-
-      concatFiles.push(`file '${ctaClipPath}'`);
-
-      mode = "two_frames_plus_cta";
-      totalDuration = safeDuration + safeCtaDuration;
-    } else {
-      console.log("NO CTA URL RECEIVED, rendering only 2 frames");
-    }
-
-    const concatFileContent = concatFiles.join("\n");
-    await fs.writeFile(concatListPath, concatFileContent, "utf8");
-
-    console.log("Concat file content >>>", concatFileContent);
-
-    await runFfmpeg([
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      concatListPath,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-pix_fmt",
-      "yuv420p",
-      "-movflags",
-      "+faststart",
-      "-an",
-      outputVideoPath,
-    ]);
-
-    await cleanupFiles(tempFiles);
-
-    const videoUrl = `${BASE_URL}/videos/${outputVideoName}`;
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
 
     return res.json({
-      video_url: videoUrl,
-      status: "video_ready",
-      ffmpeg_path: ffmpegPath,
-      mode,
-      duration: totalDuration,
-      frame_duration: frameClipDuration,
-      cta_duration: safeCtaUrl ? safeCtaDuration : 0,
-      has_cta: !!safeCtaUrl,
-      used_format: `${width}x${height}`,
+      ok: true,
+      video_url: `${baseUrl}/videos/${jobId}.mp4`,
+      content_id: jobId,
+      used_cta: Boolean(safeCtaUrl),
+      duration_seconds: safeCtaUrl ? mainDuration + ctaDuration : mainDuration,
+      format: `${width}x${height}`,
     });
   } catch (error) {
     console.error("Render error:", error);
 
-    await cleanupFiles(tempFiles);
-
     return res.status(500).json({
-      error: "Render failed",
-      details: error.message,
-      ffmpeg_path: ffmpegPath,
+      ok: false,
+      error: error.message || "Unknown render error",
     });
+  } finally {
+    for (const file of tempFiles) {
+      try {
+        if (await fs.pathExists(file)) {
+          await fs.remove(file);
+        }
+      } catch (e) {
+        console.warn("Failed to remove temp file:", file);
+      }
+    }
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
